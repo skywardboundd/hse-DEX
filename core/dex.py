@@ -39,12 +39,12 @@ class DexManager:
         return Address((0, stateInit.serialize().hash))
 
     
-    async def get_price(self, tonapi: AsyncTonapi, token_in: str, token_out: str) -> float:
+    async def get_price(self, token_in: str, token_out: str) -> float:
         """Получение цены токена через TonAPI"""
         try:
             vault = self.get_vault_address(token_in)
             amm_pool_address = self.get_amm_address(token_in, token_out)
-            expected_price = await tonapi.blockchain.execute_get_method(amm_pool_address, 'get_expected_price', [vault])
+            expected_price = await self.tonapi.blockchain.execute_get_method(amm_pool_address, 'get_expected_price', [vault])
             return expected_price
 
         except Exception as e:
@@ -100,12 +100,12 @@ class DexManager:
         
         msg = {"to": vault1_address}
         msg["body"] = createJettonVaultSwapRequest(vault2_address, amount, 0, self.payloadOnSuccess, self.payloadOnError)
-        msg["valid_until"] = int(time.time()) + 60 * 10
         msg['value'] = int(0.55 * 1e9)
-        return msg
+        msg["valid_until"] = int(time.time()) + 60 * 10
+        return {"valid_until": int(time.time()) + 60 * 10, "messages": [msg] }
     
     async def get_liquidity(self, token_pair: str) -> dict:
-        """Получение информации о ликвидности пула через TonAPI"""
+
         try:
             token_in, token_out = token_pair.split('/')
             pool_info = await self.tonapi.get_pool_info(

@@ -889,72 +889,101 @@ async def process_liquidity_token1(message: Message, state: FSMContext):
 async def process_liquidity_token2(message: Message, state: FSMContext):
     """Обработка второго токена для добавления ликвидности"""
     try:
-        token_symbol = message.text.upper()
+        token_input = message.text.strip()
+        data = await state.get_data()
+        token1 = data.get('token1')
         
-        # Проверяем наличие токена в БД
-        token_info = await get_token(token_symbol)
+        # Проверяем, является ли ввод адресом
+        is_address = False
+        try:
+            from pytoniq import Address
+            Address(token_input)
+            is_address = (token_input.startswith('EQ') or token_input.startswith('UQ')) and len(token_input) >= 48
+        except Exception:
+            is_address = False
         
-        if not token_info:
-            # Если токен не найден в БД, запрашиваем дополнительную информацию
-            await state.update_data(new_token_symbol=token_symbol)
-            await state.set_state(DexStates.waiting_for_token_master_address)
+        token_symbol = None
+        token_info = None
+        
+        if is_address:
+            # Проверяем наличие токена в БД по адресу
+            try:
+                token_info = await get_token_by_address(token_input)
+                if token_info:
+                    token_symbol = token_info.get('token_symbol')
+                else:
+                    await message.answer(
+                        "❌ Токен с таким адресом не найден в базе данных.\n"
+                        "Пожалуйста, введите символ существующего токена:",
+                        reply_markup=InlineKeyboardBuilder()
+                            .button(text="🔙 Отмена", callback_data="add_liquidity")
+                            .as_markup()
+                    )
+                    return
+            except Exception as e:
+                print(f"Error getting token by address: {e}")
+                await message.answer(
+                    "❌ Ошибка при поиске токена. Пожалуйста, введите символ токена:",
+                    reply_markup=InlineKeyboardBuilder()
+                        .button(text="🔙 Отмена", callback_data="add_liquidity")
+                        .as_markup()
+                )
+                return
+        else:
+            # Обрабатываем как символ токена
+            token_symbol = token_input.upper()
             
+            # Проверяем наличие токена в БД по символу
+            try:
+                token_info = await get_token(token_symbol)
+                if not token_info:
+                    await message.answer(
+                        f"❌ Токен {token_symbol} не найден в базе данных.\n"
+                        "Пожалуйста, введите один из доступных токенов:",
+                        reply_markup=InlineKeyboardBuilder()
+                            .button(text="🔙 Отмена", callback_data="add_liquidity")
+                            .as_markup()
+                    )
+                    return
+            except Exception as e:
+                print(f"Error getting token: {e}")
+                await message.answer(
+                    "❌ Ошибка при поиске токена. Пожалуйста, попробуйте снова:",
+                    reply_markup=InlineKeyboardBuilder()
+                        .button(text="🔙 Отмена", callback_data="add_liquidity")
+                        .as_markup()
+                )
+                return
+
+        # Проверяем, что токены разные
+        if token1 == token_symbol:
             await message.answer(
-                f"Токен {token_symbol} не найден в базе данных.\n\n"
-                f"Пожалуйста, введите адрес мастер-контракта токена:",
+                "❌ Токены должны быть разными. Введите другой токен:",
                 reply_markup=InlineKeyboardBuilder()
                     .button(text="🔙 Отмена", callback_data="add_liquidity")
                     .as_markup()
             )
             return
 
-        data = await state.get_data()
-        token1 = data.get('token1')
-        
-        if token1 == token_symbol:
-            await message.answer(
-                "Токены должны быть разными. Введите другой токен:",
-                reply_markup=InlineKeyboardBuilder()
-                    .button(text="🔙 Назад", callback_data="add_liquidity")
-                    .as_markup()
-            )
-            return
-
-        # Добавляем пару в избранное через модуль db_bot
+        # Добавляем пару в избранное
         try:
             user_id = message.from_user.id
             db_bot.add_favorite_pair(user_id, token1, token_symbol)
         except Exception as e:
             print(f"Error adding favorite pair: {e}")
-        
-        await state.update_data(token2=token_symbol)
-        
-        # Проверяем, существует ли пул для данной пары токенов
-        pool = await dex_manager.get_pool(token1, token_symbol)
-        
-        if not pool:
-            await message.answer(
-                f"⚠️ Пул для пары {token1}/{token_symbol} еще не создан. "
-                f"Вы будете первым, кто добавит ликвидность в этот пул.\n\n"
-                f"Введите количество {token1} для добавления в пул:",
-                reply_markup=InlineKeyboardBuilder()
-                    .button(text="🔙 Назад", callback_data="add_liquidity")
-                    .as_markup()
-            )
-        else:
-            token1_reserve = pool.get("token1_reserve", 0)
-            token2_reserve = pool.get("token2_reserve", 0)
-            ratio = token2_reserve / token1_reserve if token1_reserve else 0
             
-            await message.answer(
-                f"Пул {token1}/{token_symbol}\n"
-                f"Текущие резервы: {token1_reserve} {token1} и {token2_reserve} {token_symbol}\n"
-                f"Соотношение: 1 {token1} = {ratio} {token_symbol}\n\n"
-                f"Введите количество {token1} для добавления в пул:",
-                reply_markup=InlineKeyboardBuilder()
-                    .button(text="🔙 Назад", callback_data="add_liquidity")
-                    .as_markup()
-            )
+        # Получаем курс обмена
+        try:
+            rate = await dex_manager.get_price(token1, token_symbol)
+        except Exception as e:
+            print(f"Error getting price: {e}")
+            rate = 0.0  # Заглушка на случай ошибки
+            
+        await state.update_data(token2=token_symbol, rate=rate)
+        
+        await message.answer(
+            f"✅ Пара {token1}/{token_symbol} добавлена в избранное!"
+        )
         
         await state.set_state(DexStates.waiting_for_liquidity_amount1)
     except Exception as e:
@@ -1102,8 +1131,8 @@ async def start_swap(callback: CallbackQuery, state: FSMContext):
         builder = InlineKeyboardBuilder()
         
         if favorite_pairs:
-            # Отображаем избранные пары пользователя
-            for pair in favorite_pairs[:6]:  # Ограничиваем количество отображаемых пар
+            # Отображаем избранные пары пользователя (не более 4)
+            for pair in favorite_pairs[:4]:  # Ограничиваем количество отображаемых пар до 4
                 token1 = pair.get('token1', '').upper()
                 token2 = pair.get('token2', '').upper()
                 pair_text = f"{token1}/{token2}"
@@ -1112,7 +1141,7 @@ async def start_swap(callback: CallbackQuery, state: FSMContext):
             builder.adjust(2)  # Располагаем кнопки по 2 в ряд
         
         # Добавляем опцию создания пользовательского свопа
-        builder.button(text="✏️ Пользовательский своп", callback_data="custom_swap")
+        builder.button(text="✏️ Выбрать другие токены", callback_data="custom_swap")
         builder.button(text="🔙 Меню", callback_data="menu")
         builder.adjust(1)
         
@@ -1180,20 +1209,260 @@ async def select_pair(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "custom_swap")
 async def custom_swap(callback: CallbackQuery, state: FSMContext):
-    # Получаем список всех токенов из БД
+    # Получаем список доступных токенов из БД
     tokens = await get_all_tokens()
     
-    # Формируем текст с доступными токенами
+    if not tokens:
+        await callback.message.edit_text(
+            "❌ В базе данных нет доступных токенов.\n"
+            "Пожалуйста, обратитесь к администратору.",
+            reply_markup=InlineKeyboardBuilder()
+                .button(text="🔙 Назад", callback_data="swap")
+                .as_markup()
+        )
+        return
+    
+    # Показываем список доступных токенов (до 10)
     available_tokens = ", ".join([token.get('token_symbol', '') for token in tokens[:10]])
+    total_tokens = len(tokens)
+    
+    message_text = (
+        f"🪙 Доступные токены ({min(10, total_tokens)} из {total_tokens}):\n"
+        f"{available_tokens}"
+    )
+    
+    if total_tokens > 10:
+        message_text += "... и другие"
+    
+    message_text += (
+        "\n\n✏️ Создание пары для обмена:\n\n"
+        "1. Введите символ или адрес первого токена\n"
+        "2. Затем введите символ или адрес второго токена\n"
+        "3. Пара будет добавлена в избранное\n\n"
+        "👛 Введите символ или адрес первого токена:"
+    )
     
     await state.set_state(DexStates.waiting_for_token1)
     await callback.message.edit_text(
-        f"Доступные токены: {available_tokens}...\n\n"
-        "Введите символ токена, который хотите обменять (например, TON, USDT):",
+        message_text,
         reply_markup=InlineKeyboardBuilder()
             .button(text="🔙 Отмена", callback_data="swap")
             .as_markup()
     )
+
+@dp.message(DexStates.waiting_for_token1)
+async def process_token1(message: Message, state: FSMContext):
+    """Обработка первого токена для свопа"""
+    try:
+        token_input = message.text.strip()
+        
+        # Проверяем, является ли ввод адресом
+        is_address = False
+        try:
+            from pytoniq import Address
+            Address(token_input)
+            is_address = (token_input.startswith('EQ') or token_input.startswith('UQ')) and len(token_input) >= 48
+        except Exception:
+            is_address = False
+        
+        token_symbol = None
+        token_info = None
+        
+        if is_address:
+            # Проверяем наличие токена в БД по адресу
+            try:
+                token_info = await get_token_by_address(token_input)
+                if token_info:
+                    token_symbol = token_info.get('token_symbol')
+                else:
+                    await message.answer(
+                        "❌ Токен с таким адресом не найден в базе данных.\n"
+                        "Пожалуйста, введите символ существующего токена:",
+                        reply_markup=InlineKeyboardBuilder()
+                            .button(text="🔙 Отмена", callback_data="swap")
+                            .as_markup()
+                    )
+                    return
+            except Exception as e:
+                print(f"Error getting token by address: {e}")
+                await message.answer(
+                    "❌ Ошибка при поиске токена. Пожалуйста, введите символ токена:",
+                    reply_markup=InlineKeyboardBuilder()
+                        .button(text="🔙 Отмена", callback_data="swap")
+                        .as_markup()
+                )
+                return
+        else:
+            # Обрабатываем как символ токена
+            token_symbol = token_input.upper()
+            
+            # Проверяем наличие токена в БД по символу
+            try:
+                token_info = await get_token(token_symbol)
+                if not token_info:
+                    await message.answer(
+                        f"❌ Токен {token_symbol} не найден в базе данных.\n"
+                        "Пожалуйста, введите один из доступных токенов:",
+                        reply_markup=InlineKeyboardBuilder()
+                            .button(text="🔙 Отмена", callback_data="swap")
+                            .as_markup()
+                    )
+                    return
+            except Exception as e:
+                print(f"Error getting token: {e}")
+                await message.answer(
+                    "❌ Ошибка при поиске токена. Пожалуйста, попробуйте снова:",
+                    reply_markup=InlineKeyboardBuilder()
+                        .button(text="🔙 Отмена", callback_data="swap")
+                        .as_markup()
+                )
+                return
+
+        # Сохраняем токен и переходим к следующему шагу
+        await state.update_data(token1=token_symbol)
+        await state.set_state(DexStates.waiting_for_token2)
+        
+        # Получаем список доступных токенов для второго выбора
+        tokens = await get_all_tokens()
+        available_tokens = ", ".join([token.get('token_symbol', '') for token in tokens[:10]])
+        if len(tokens) > 10:
+            available_tokens += "... и другие"
+            
+        await message.answer(
+            f"✅ Выбран первый токен: {token_symbol}\n\n"
+            f"Доступные токены: {available_tokens}\n\n"
+            "Введите символ или адрес второго токена:",
+            reply_markup=InlineKeyboardBuilder()
+                .button(text="🔙 Отмена", callback_data="swap")
+                .as_markup()
+        )
+    except Exception as e:
+        await message.answer(
+            f"❌ Ошибка: {str(e)}",
+            reply_markup=InlineKeyboardBuilder()
+                .button(text="🔙 Назад", callback_data="swap")
+                .as_markup()
+        )
+        await state.clear()
+
+@dp.message(DexStates.waiting_for_token2)
+async def process_token2(message: Message, state: FSMContext):
+    """Обработка второго токена для свопа"""
+    try:
+        token_input = message.text.strip()
+        data = await state.get_data()
+        token1 = data.get('token1')
+        
+        # Проверяем, является ли ввод адресом
+        is_address = False
+        try:
+            from pytoniq import Address
+            Address(token_input)
+            is_address = (token_input.startswith('EQ') or token_input.startswith('UQ')) and len(token_input) >= 48
+        except Exception:
+            is_address = False
+        
+        token_symbol = None
+        token_info = None
+        
+        if is_address:
+            # Проверяем наличие токена в БД по адресу
+            try:
+                token_info = await get_token_by_address(token_input)
+                if token_info:
+                    token_symbol = token_info.get('token_symbol')
+                else:
+                    await message.answer(
+                        "❌ Токен с таким адресом не найден в базе данных.\n"
+                        "Пожалуйста, введите символ существующего токена:",
+                        reply_markup=InlineKeyboardBuilder()
+                            .button(text="🔙 Отмена", callback_data="swap")
+                            .as_markup()
+                    )
+                    return
+            except Exception as e:
+                print(f"Error getting token by address: {e}")
+                await message.answer(
+                    "❌ Ошибка при поиске токена. Пожалуйста, введите символ токена:",
+                    reply_markup=InlineKeyboardBuilder()
+                        .button(text="🔙 Отмена", callback_data="swap")
+                        .as_markup()
+                )
+                return
+        else:
+            # Обрабатываем как символ токена
+            token_symbol = token_input.upper()
+            
+            # Проверяем наличие токена в БД по символу
+            try:
+                token_info = await get_token(token_symbol)
+                if not token_info:
+                    await message.answer(
+                        f"❌ Токен {token_symbol} не найден в базе данных.\n"
+                        "Пожалуйста, введите один из доступных токенов:",
+                        reply_markup=InlineKeyboardBuilder()
+                            .button(text="🔙 Отмена", callback_data="swap")
+                            .as_markup()
+                    )
+                    return
+            except Exception as e:
+                print(f"Error getting token: {e}")
+                await message.answer(
+                    "❌ Ошибка при поиске токена. Пожалуйста, попробуйте снова:",
+                    reply_markup=InlineKeyboardBuilder()
+                        .button(text="🔙 Отмена", callback_data="swap")
+                        .as_markup()
+                )
+                return
+
+        # Проверяем, что токены разные
+        if token1 == token_symbol:
+            await message.answer(
+                "❌ Токены должны быть разными. Введите другой токен:",
+                reply_markup=InlineKeyboardBuilder()
+                    .button(text="🔙 Отмена", callback_data="swap")
+                    .as_markup()
+            )
+            return
+
+        # Добавляем пару в избранное
+        try:
+            user_id = message.from_user.id
+            db_bot.add_favorite_pair(user_id, token1, token_symbol)
+        except Exception as e:
+            print(f"Error adding favorite pair: {e}")
+            
+        # Получаем курс обмена
+        try:
+            rate = await dex_manager.get_price(token1, token_symbol)
+        except Exception as e:
+            print(f"Error getting price: {e}")
+            rate = 0.0  # Заглушка на случай ошибки
+            
+        await state.update_data(token2=token_symbol, rate=rate)
+        
+        await message.answer(
+            f"✅ Пара {token1}/{token_symbol} добавлена в избранное!"
+        )
+        
+        await state.set_state(DexStates.waiting_for_amount)
+        
+        await message.answer(
+            f"🔄 Обмен {token1} → {token_symbol}\n\n"
+            f"Примерный курс: 1 {token1} ≈ {rate} {token_symbol}\n\n"
+            f"Введите количество {token1} для обмена:",
+            reply_markup=InlineKeyboardBuilder()
+                .button(text="🔙 Назад", callback_data="swap")
+                .as_markup()
+        )
+    except Exception as e:
+        await message.answer(
+            f"❌ Ошибка: {str(e)}",
+            reply_markup=InlineKeyboardBuilder()
+                .button(text="🔙 Назад", callback_data="swap")
+                .as_markup()
+        )
+        await state.clear()
 
 @dp.message(DexStates.waiting_for_amount)
 async def process_amount(message: Message, state: FSMContext):
@@ -1219,7 +1488,7 @@ async def process_amount(message: Message, state: FSMContext):
         
         connector = get_connector(message.from_user.id)
         
-        # Примерная сумма для получения
+        # Расчет итоговой суммы
         receive_amount = amount * rate
         
         # Подтверждение свопа
@@ -1254,15 +1523,6 @@ async def confirm_swap(callback: CallbackQuery, state: FSMContext):
         token2 = data['token2']
         rate = data['rate']
         
-        # Проверяем, есть ли у нас адреса новых токенов
-        token1_address = None
-        if 'new_token_symbol' in data and data.get('new_token_symbol') == token1 and 'new_token_master' in data:
-            token1_address = data.get('new_token_master')
-            
-        token2_address = None
-        if 'new_token_symbol' in data and data.get('new_token_symbol') == token2 and 'new_token_master' in data:
-            token2_address = data.get('new_token_master')
-        
         # Расчет итоговой суммы
         receive_amount = amount * rate
         
@@ -1277,9 +1537,7 @@ async def confirm_swap(callback: CallbackQuery, state: FSMContext):
                 token1=token1,
                 token2=token2,
                 amount=amount,
-                wallet_address=wallet_address,
-                token1_address=token1_address,
-                token2_address=token2_address
+                wallet_address=wallet_address
             )
             
             # Отправляем транзакцию на подписание
@@ -1316,372 +1574,6 @@ async def confirm_swap(callback: CallbackQuery, state: FSMContext):
         await state.clear()
     except Exception as e:
         await callback.message.edit_text(
-            f"❌ Ошибка: {str(e)}",
-            reply_markup=InlineKeyboardBuilder()
-                .button(text="🔙 Назад", callback_data="swap")
-                .as_markup()
-        )
-        await state.clear()
-
-@dp.message(DexStates.waiting_for_token1)
-async def process_token1(message: Message, state: FSMContext):
-    """Обработка первого токена для свопа"""
-    try:
-        token_input = message.text.strip()
-        
-        # Проверяем, является ли ввод адресом мастер-контракта
-        is_address = (token_input.startswith('EQ') or token_input.startswith('UQ')) and len(token_input) >= 48
-        
-        if is_address:
-            # Проверяем валидность адреса через pytoniq
-            try:
-                from pytoniq import Address
-                Address(token_input)
-            except Exception:
-                await message.answer(
-                    "Неверный формат адреса. Пожалуйста, введите корректный адрес мастер-контракта или символ токена:",
-                    reply_markup=InlineKeyboardBuilder()
-                        .button(text="🔙 Отмена", callback_data="swap")
-                        .as_markup()
-                )
-                return
-                
-            # Проверяем наличие токена в БД по адресу
-            token_info = await get_token_by_address(token_input)
-            if token_info:
-                # Токен найден по адресу, используем его символ
-                token_symbol = token_info.get('token_symbol')
-            else:
-                # Токен не найден по адресу, запрашиваем информацию
-                await state.update_data(new_token_master=token_input)
-                await state.set_state(DexStates.waiting_for_token_master_address)
-                
-                await message.answer(
-                    f"Токен с адресом {token_input} не найден в базе данных.\n\n"
-                    f"Пожалуйста, введите символ (название) токена:",
-                    reply_markup=InlineKeyboardBuilder()
-                        .button(text="🔙 Отмена", callback_data="swap")
-                        .as_markup()
-                )
-                return
-        else:
-            # Обрабатываем как символ токена
-            token_symbol = token_input.upper()
-            
-            # Проверяем наличие токена в БД по символу
-            token_info = await get_token(token_symbol)
-            
-            if not token_info:
-                # Если токен не найден в БД, запрашиваем дополнительную информацию
-                await state.update_data(new_token_symbol=token_symbol)
-                await state.set_state(DexStates.waiting_for_token_master_address)
-                
-                await message.answer(
-                    f"Токен {token_symbol} не найден в базе данных.\n\n"
-                    f"Пожалуйста, введите адрес мастер-контракта токена:",
-                    reply_markup=InlineKeyboardBuilder()
-                        .button(text="🔙 Отмена", callback_data="swap")
-                        .as_markup()
-                )
-                return
-
-        # Токен найден, сохраняем и переходим к следующему шагу
-        await state.update_data(token1=token_symbol)
-        await state.set_state(DexStates.waiting_for_token2)
-        
-        await message.answer(
-            "Введите символ или адрес второго токена:",
-            reply_markup=InlineKeyboardBuilder()
-                .button(text="🔙 Отмена", callback_data="swap")
-                .as_markup()
-        )
-    except Exception as e:
-        await message.answer(
-            f"❌ Ошибка: {str(e)}",
-            reply_markup=InlineKeyboardBuilder()
-                .button(text="🔙 Назад", callback_data="swap")
-                .as_markup()
-        )
-        await state.clear()
-
-@dp.message(DexStates.waiting_for_token_master_address)
-async def process_token_master_address(message: Message, state: FSMContext):
-    """Обработка адреса мастер-контракта или символа для нового токена"""
-    try:
-        data = await state.get_data()
-        input_text = message.text.strip()
-        
-        # Определяем, был ли предыдущий ввод адресом или символом
-        if 'new_token_master' in data:
-            # Предыдущий ввод был адресом, текущий ввод - символ
-            token_symbol = input_text.upper()
-            master_address = data['new_token_master']
-            
-            # Сохраняем токен в БД
-            await save_token(token_symbol, master_address)
-            
-            # Определяем следующий шаг
-            if 'token1' not in data:
-                # Если мы обрабатываем первый токен
-                await state.update_data(token1=token_symbol)
-                await state.set_state(DexStates.waiting_for_token2)
-                
-                await message.answer(
-                    "Введите символ или адрес второго токена:",
-                    reply_markup=InlineKeyboardBuilder()
-                        .button(text="🔙 Отмена", callback_data="swap")
-                        .as_markup()
-                )
-            else:
-                # Если мы обрабатываем второй токен
-                token1 = data['token1']
-                
-                if token1 == token_symbol:
-                    await message.answer(
-                        "Токены должны быть разными. Введите другой токен:",
-                        reply_markup=InlineKeyboardBuilder()
-                            .button(text="🔙 Отмена", callback_data="swap")
-                            .as_markup()
-                    )
-                    return
-                
-                # Примерный курс
-                rate = 1.0  # Временное значение
-                
-                await state.update_data(token2=token_symbol, rate=rate)
-                await state.set_state(DexStates.waiting_for_amount)
-                
-                await message.answer(
-                    f"🔄 Обмен {token1} → {token_symbol}\n\n"
-                    f"Примерный курс: 1 {token1} ≈ {rate} {token_symbol}\n\n"
-                    f"Введите количество {token1} для обмена:",
-                    reply_markup=InlineKeyboardBuilder()
-                        .button(text="🔙 Назад", callback_data="swap")
-                        .as_markup()
-                )
-        else:
-            # Предыдущий ввод был символом, текущий ввод - адрес
-            master_address = input_text
-            
-            # Проверяем, что это валидный адрес
-            valid_address = False
-            try:
-                from pytoniq import Address
-                Address(master_address)
-                valid_address = (master_address.startswith('EQ') or master_address.startswith('UQ')) and len(master_address) >= 48
-            except Exception:
-                valid_address = False
-                
-            if not valid_address:
-                await message.answer(
-                    "Неверный формат адреса. Пожалуйста, введите корректный адрес мастер-контракта (начинающийся с EQ или UQ):",
-                    reply_markup=InlineKeyboardBuilder()
-                        .button(text="🔙 Отмена", callback_data="swap")
-                        .as_markup()
-                )
-                return
-            
-            # Проверяем, существует ли уже такой токен
-            token_info = await get_token_by_address(master_address)
-            if token_info:
-                await message.answer(
-                    f"Токен с таким адресом уже существует с символом {token_info.get('token_symbol')}. Используем его.",
-                    reply_markup=InlineKeyboardBuilder()
-                        .button(text="🔙 Отмена", callback_data="swap")
-                        .as_markup()
-                )
-                
-                token_symbol = token_info.get('token_symbol')
-                
-                # Определяем следующий шаг
-                if 'token1' not in data:
-                    # Если это первый токен
-                    await state.update_data(token1=token_symbol)
-                    await state.set_state(DexStates.waiting_for_token2)
-                    
-                    await message.answer(
-                        "Введите символ или адрес второго токена:",
-                        reply_markup=InlineKeyboardBuilder()
-                            .button(text="🔙 Отмена", callback_data="swap")
-                            .as_markup()
-                    )
-                else:
-                    token1 = data['token1']
-                    
-                    if token1 == token_symbol:
-                        await message.answer(
-                            "Токены должны быть разными. Введите другой токен:",
-                            reply_markup=InlineKeyboardBuilder()
-                                .button(text="🔙 Отмена", callback_data="swap")
-                                .as_markup()
-                        )
-                        return
-                    
-                    # Получаем курс обмена
-                    rate = await dex_manager.get_price(token1, token_symbol)
-                    
-                    await state.update_data(token2=token_symbol, rate=rate)
-                    await state.set_state(DexStates.waiting_for_amount)
-                    
-                    await message.answer(
-                        f"🔄 Обмен {token1} → {token_symbol}\n\n"
-                        f"Примерный курс: 1 {token1} ≈ {rate} {token_symbol}\n\n"
-                        f"Введите количество {token1} для обмена:",
-                        reply_markup=InlineKeyboardBuilder()
-                            .button(text="🔙 Назад", callback_data="swap")
-                            .as_markup()
-                    )
-                return
-                
-            # Сохраняем токен в БД
-            token_symbol = data['new_token_symbol']
-            await save_token(token_symbol, master_address)
-            
-            # Определяем следующий шаг
-            if 'token1' not in data:
-                # Если это первый токен
-                await state.update_data(token1=token_symbol)
-                await state.set_state(DexStates.waiting_for_token2)
-                
-                await message.answer(
-                    "Введите символ или адрес второго токена:",
-                    reply_markup=InlineKeyboardBuilder()
-                        .button(text="🔙 Отмена", callback_data="swap")
-                        .as_markup()
-                )
-            else:
-                # Если это второй токен
-                token1 = data['token1']
-                
-                if token1 == token_symbol:
-                    await message.answer(
-                        "Токены должны быть разными. Введите другой токен:",
-                        reply_markup=InlineKeyboardBuilder()
-                            .button(text="🔙 Отмена", callback_data="swap")
-                            .as_markup()
-                    )
-                    return
-                
-                # Примерный курс
-                rate = 1.0  # Временное значение
-                
-                await state.update_data(token2=token_symbol, rate=rate)
-                await state.set_state(DexStates.waiting_for_amount)
-                
-                await message.answer(
-                    f"🔄 Обмен {token1} → {token_symbol}\n\n"
-                    f"Примерный курс: 1 {token1} ≈ {rate} {token_symbol}\n\n"
-                    f"Введите количество {token1} для обмена:",
-                    reply_markup=InlineKeyboardBuilder()
-                        .button(text="🔙 Назад", callback_data="swap")
-                        .as_markup()
-                )
-    except Exception as e:
-        await message.answer(
-            f"❌ Ошибка: {str(e)}",
-            reply_markup=InlineKeyboardBuilder()
-                .button(text="🔙 Назад", callback_data="swap")
-                .as_markup()
-        )
-        await state.clear()
-
-@dp.message(DexStates.waiting_for_token2)
-async def process_token2(message: Message, state: FSMContext):
-    """Обработка второго токена для свопа"""
-    try:
-        token_input = message.text.strip()
-        data = await state.get_data()
-        token1 = data.get('token1')
-        
-        # Проверяем, является ли ввод адресом мастер-контракта
-        is_address = (token_input.startswith('EQ') or token_input.startswith('UQ')) and len(token_input) >= 48
-        
-        if is_address:
-            # Проверяем валидность адреса через pytoniq
-            try:
-                from pytoniq import Address
-                Address(token_input)
-            except Exception as e:
-                logging.info(f"{e}")
-                await message.answer(
-                    "Неверный формат адреса. Пожалуйста, введите корректный адрес мастер-контракта или символ токена:",
-                    reply_markup=InlineKeyboardBuilder()
-                        .button(text="🔙 Отмена", callback_data="swap")
-                        .as_markup()
-                )
-                return
-                
-            # Проверяем наличие токена в БД по адресу
-            token_info = await get_token_by_address(token_input)
-            if token_info:
-                # Токен найден по адресу, используем его символ
-                token_symbol = token_info.get('token_symbol')
-            else:
-                # Токен не найден по адресу, запрашиваем информацию
-                await state.update_data(new_token_master=token_input)
-                await state.set_state(DexStates.waiting_for_token_master_address)
-                
-                await message.answer(
-                    f"Токен с адресом {token_input} не найден в базе данных.\n\n"
-                    f"Пожалуйста, введите символ (название) токена:",
-                    reply_markup=InlineKeyboardBuilder()
-                        .button(text="🔙 Отмена", callback_data="swap")
-                        .as_markup()
-                )
-                return
-        else:
-            # Обрабатываем как символ токена
-            token_symbol = token_input.upper()
-            
-            # Проверяем наличие токена в БД по символу
-            token_info = await get_token(token_symbol)
-            
-            if not token_info:
-                # Если токен не найден в БД, запрашиваем дополнительную информацию
-                await state.update_data(new_token_symbol=token_symbol)
-                await state.set_state(DexStates.waiting_for_token_master_address)
-                
-                await message.answer(
-                    f"Токен {token_symbol} не найден в базе данных.\n\n"
-                    f"Пожалуйста, введите адрес мастер-контракта токена:",
-                    reply_markup=InlineKeyboardBuilder()
-                        .button(text="🔙 Отмена", callback_data="swap")
-                        .as_markup()
-                )
-                return
-        
-        if token1 == token_symbol:
-            await message.answer(
-                "Токены должны быть разными. Введите другой токен:",
-                reply_markup=InlineKeyboardBuilder()
-                    .button(text="🔙 Отмена", callback_data="swap")
-                    .as_markup()
-            )
-            return
-
-        # Получаем курс обмена
-        rate = await dex_manager.get_price(token1, token_symbol)
-        
-        # Добавляем пару в избранное через модуль db_bot
-        try:
-            user_id = message.from_user.id
-            db_bot.add_favorite_pair(user_id, token1, token_symbol)
-        except Exception as e:
-            print(f"Error adding favorite pair: {e}")
-        
-        await state.update_data(token2=token_symbol, rate=rate)
-        await state.set_state(DexStates.waiting_for_amount)
-        
-        await message.answer(
-            f"🔄 Обмен {token1} → {token_symbol}\n\n"
-            f"Примерный курс: 1 {token1} ≈ {rate} {token_symbol}\n\n"
-            f"Введите количество {token1} для обмена:",
-            reply_markup=InlineKeyboardBuilder()
-                .button(text="🔙 Назад", callback_data="swap")
-                .as_markup()
-        )
-    except Exception as e:
-        await message.answer(
             f"❌ Ошибка: {str(e)}",
             reply_markup=InlineKeyboardBuilder()
                 .button(text="🔙 Назад", callback_data="swap")

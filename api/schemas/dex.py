@@ -6,28 +6,28 @@ class TokenInfo(BaseModel):
     symbol: str
     address: str
     decimals: int
-    price: float
-    chart: List[List[Any]]
+    usdt_price: Optional[float] = None
+    pools: Optional[List[Dict[str, Any]]] = []
 
 class PoolInfo(BaseModel):
-    token1: TokenInfo
-    token2: TokenInfo
-    reserve1: float
-    reserve2: float
-    fee: str
-    tvl: float
-    address: str
+    token1: str
+    token2: str
+    pool_address: str
+    liquidity: float
+    token1_reserve: Optional[float] = None
+    token2_reserve: Optional[float] = None
     type: Optional[str] = None
 
 class LiquidityPosition(BaseModel):
-    id: int
+    position_id: int
+    pool_address: str
     wallet_address: str
-    token1: TokenInfo
-    token2: TokenInfo
+    token1: str
+    token2: str
     token1_amount: float
     token2_amount: float
     lp_tokens: float
-    pool_type: Optional[str] = None
+    created_at: int
 
 class SwapRoute(BaseModel):
     min_amount_out: int
@@ -43,7 +43,6 @@ class PoolChartPoint(BaseModel):
     timestamp: int
     price: float
     volume: float
-    liquidity: float
 
 class CreatePoolRequest(BaseModel):
     token1: str

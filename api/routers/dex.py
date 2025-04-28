@@ -18,7 +18,8 @@ from core.db import (
     get_pool, get_pool_by_tokens, get_pool_by_tokens_and_type, 
     get_all_pools, get_positions_by_wallet, get_positions_by_pool,
     save_pool, update_pool_liquidity, save_position, remove_position,
-    save_price, get_prices, get_latest_price
+    save_price, get_prices, get_latest_price, get_token, get_token_by_address,
+    get_latest_token_price
 )
 
 from schemas.dex import (
@@ -35,7 +36,57 @@ dex_manager = DexManager()
 async def get_token_info(token_identifier: str):
     """Получение информации о токене"""
     try:
-        return await dex_manager.get_token_info(token_identifier)
+        # Сначала пытаемся получить данные из БД
+        token_data = None
+        
+        # Проверяем, является ли идентификатор адресом или символом
+        if token_identifier.startswith('0:'):
+            token_data = await get_token_by_address(token_identifier)
+        else:
+            token_data = await get_token(token_identifier)
+            
+        if not token_data:
+            raise HTTPException(status_code=404, detail=f"Токен {token_identifier} не найден в базе данных")
+        
+        # Получаем информацию о цене в USDT
+        usdt_price = None
+        usdt_pool = None
+        
+        # Пытаемся найти пул с USDT
+        if token_data['token_symbol'] != 'USDT':
+            usdt_pool = get_pool_by_tokens(token_data['token_symbol'], 'USDT')
+            
+            if usdt_pool:
+                # Если такой пул есть, получаем цену
+                if usdt_pool['token1'] == token_data['token_symbol']:
+                    usdt_price = usdt_pool['token2_reserve'] / usdt_pool['token1_reserve']
+                else:
+                    usdt_price = usdt_pool['token1_reserve'] / usdt_pool['token2_reserve']
+        
+        # Получаем список всех пулов с этим токеном
+        all_pools = get_all_pools()
+        token_pools = []
+        
+        for pool in all_pools:
+            if pool['token1'] == token_data['token_symbol'] or pool['token2'] == token_data['token_symbol']:
+                token_pools.append({
+                    'pool_address': pool['pool_address'],
+                    'pair': f"{pool['token1']}/{pool['token2']}",
+                    'liquidity': pool['liquidity'],
+                    'type': pool['pool_type']
+                })
+        
+        # Формируем ответ
+        return TokenInfo(
+            symbol=token_data['token_symbol'],
+            name=token_data['token_name'] or token_data['token_symbol'],
+            address=token_data['master_address'],
+            decimals=token_data['decimals'],
+            usdt_price=usdt_price,
+            pools=token_pools
+        )
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -46,8 +97,7 @@ async def get_pool_info(token1: str, token2: str, type: Optional[str] = None):
         # Получаем данные напрямую из БД
         pool_data = get_pool_by_tokens_and_type(token1, token2, type)
         if not pool_data:
-            # Если пул не найден в БД, используем резервный вариант через DexManager
-            return await dex_manager.get_pool_info(f"{token1}/{token2}", pool_type=type)
+            raise HTTPException(status_code=404, detail=f"Пул для токенов {token1}/{token2} не найден в базе данных")
         
         # Формируем ответ из данных БД
         return PoolInfo(
@@ -59,6 +109,8 @@ async def get_pool_info(token1: str, token2: str, type: Optional[str] = None):
             token2_reserve=pool_data['token2_reserve'],
             type=pool_data['pool_type']
         )
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -69,8 +121,7 @@ async def get_pool_info_by_address(pool_address: str):
         # Получаем данные напрямую из БД
         pool_data = get_pool(pool_address)
         if not pool_data:
-            # Если пул не найден в БД, используем резервный вариант через DexManager
-            return await dex_manager.get_pool_info_by_address(pool_address)
+            raise HTTPException(status_code=404, detail=f"Пул с адресом {pool_address} не найден в базе данных")
         
         # Формируем ответ из данных БД
         return PoolInfo(
@@ -82,6 +133,8 @@ async def get_pool_info_by_address(pool_address: str):
             token2_reserve=pool_data['token2_reserve'],
             type=pool_data['pool_type']
         )
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -92,11 +145,13 @@ async def get_pool_chart(token1: str, token2: str, type: Optional[str] = None, t
         # Сначала получаем адрес пула из БД
         pool_data = get_pool_by_tokens_and_type(token1, token2, type)
         if not pool_data:
-            # Если пул не найден, используем DexManager
-            return await dex_manager.get_pool_chart(f"{token1}/{token2}", timeframe, limit, pool_type=type)
+            raise HTTPException(status_code=404, detail=f"Пул для токенов {token1}/{token2} не найден в базе данных")
         
-        # Получаем исторические цены из БД
-        prices = get_prices(pool_data['pool_address'], limit=limit)
+        # Получаем исторические цены из БД без ограничений по времени
+        prices = get_prices(pool_data['pool_address'])
+        
+        if not prices:
+            raise HTTPException(status_code=404, detail=f"Данные о ценах для пула {token1}/{token2} не найдены в базе данных")
         
         # Формируем данные для графика
         chart_data = []
@@ -108,6 +163,8 @@ async def get_pool_chart(token1: str, token2: str, type: Optional[str] = None, t
             ))
         
         return chart_data
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -115,8 +172,16 @@ async def get_pool_chart(token1: str, token2: str, type: Optional[str] = None, t
 async def get_pool_chart_by_address(pool_address: str, timeframe: str = "1d", limit: int = 100):
     """Получение графика пула по адресу пула"""
     try:
-        # Получаем исторические цены из БД
-        prices = get_prices(pool_address, limit=limit)
+        # Проверяем, существует ли пул с таким адресом
+        pool_data = get_pool(pool_address)
+        if not pool_data:
+            raise HTTPException(status_code=404, detail=f"Пул с адресом {pool_address} не найден в базе данных")
+        
+        # Получаем исторические цены из БД без ограничений по времени
+        prices = get_prices(pool_address)
+        
+        if not prices:
+            raise HTTPException(status_code=404, detail=f"Данные о ценах для пула с адресом {pool_address} не найдены в базе данных")
         
         # Формируем данные для графика
         chart_data = []
@@ -127,11 +192,9 @@ async def get_pool_chart_by_address(pool_address: str, timeframe: str = "1d", li
                 volume=0  # В данных цен нет объемов, поэтому ставим 0
             ))
         
-        if not chart_data:
-            # Если данные не найдены, используем DexManager
-            return await dex_manager.get_pool_chart_by_address(pool_address, timeframe, limit)
-        
         return chart_data
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -141,6 +204,9 @@ async def get_liquidity_positions(wallet_address: str):
     try:
         # Получаем данные напрямую из БД
         positions = get_positions_by_wallet(wallet_address)
+        
+        if not positions:
+            raise HTTPException(status_code=404, detail=f"Позиции ликвидности для кошелька {wallet_address} не найдены в базе данных")
         
         # Формируем ответ из данных БД
         result = []
@@ -162,11 +228,9 @@ async def get_liquidity_positions(wallet_address: str):
                 )
                 result.append(position)
         
-        if not result:
-            # Если позиции не найдены, используем резервный вариант через DexManager
-            return await dex_manager.get_user_liquidity_positions(wallet_address)
-        
         return result
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -215,9 +279,9 @@ async def create_pool(
         )
         
         return transaction
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/pool/add-liquidity", response_model=SwapTransaction)
@@ -236,7 +300,7 @@ async def add_liquidity(
         if not pool_data:
             # Если пул не найден, вызываем ошибку
             raise HTTPException(
-                status_code=400, 
+                status_code=404, 
                 detail=f"Пул для токенов {token1}/{token2} не найден. Сначала создайте пул."
             )
         
@@ -279,9 +343,9 @@ async def add_liquidity(
         )
         
         return transaction
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/pool/address/{pool_address}/add-liquidity", response_model=SwapTransaction)
@@ -296,13 +360,7 @@ async def add_liquidity_by_address(
         # Находим пул в БД
         pool_data = get_pool(pool_address)
         if not pool_data:
-            # Если пул не найден, используем DexManager
-            return await dex_manager.create_add_liquidity_transaction_by_address(
-                pool_address,
-                token1_amount,
-                token2_amount,
-                wallet_address
-            )
+            raise HTTPException(status_code=404, detail=f"Пул с адресом {pool_address} не найден в базе данных")
         
         # Создаем транзакцию через DexManager
         transaction = await dex_manager.create_add_liquidity_transaction_by_address(
@@ -338,6 +396,8 @@ async def add_liquidity_by_address(
         )
         
         return transaction
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -354,12 +414,7 @@ async def remove_liquidity(
         position = next((p for p in positions if p['id'] == position_id), None)
         
         if not position:
-            # Если позиция не найдена, используем DexManager
-            return await dex_manager.create_remove_liquidity_transaction(
-                position_id,
-                wallet_address,
-                pool_type=type
-            )
+            raise HTTPException(status_code=404, detail=f"Позиция #{position_id} не найдена для кошелька {wallet_address}")
         
         # Проверяем, что позиция принадлежит указанному кошельку
         if position['wallet_address'] != wallet_address:
@@ -373,12 +428,7 @@ async def remove_liquidity(
         pool_data = get_pool(pool_address)
         
         if not pool_data:
-            # Если пул не найден, используем DexManager
-            return await dex_manager.create_remove_liquidity_transaction(
-                position_id,
-                wallet_address,
-                pool_type=type
-            )
+            raise HTTPException(status_code=404, detail=f"Пул с адресом {pool_address} не найден в базе данных")
         
         # Создаем транзакцию через DexManager
         transaction = await dex_manager.create_remove_liquidity_transaction(
@@ -404,9 +454,9 @@ async def remove_liquidity(
         remove_position(wallet_address, pool_address)
         
         return transaction
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/pool/address/{pool_address}/remove-liquidity", response_model=SwapTransaction)
@@ -422,12 +472,7 @@ async def remove_liquidity_by_address(
         position = next((p for p in positions if p['id'] == position_id and p['pool_address'] == pool_address), None)
         
         if not position:
-            # Если позиция не найдена, используем DexManager
-            return await dex_manager.create_remove_liquidity_transaction_by_address(
-                pool_address,
-                position_id,
-                wallet_address
-            )
+            raise HTTPException(status_code=404, detail=f"Позиция #{position_id} не найдена для кошелька {wallet_address} в пуле {pool_address}")
         
         # Проверяем, что позиция принадлежит указанному кошельку
         if position['wallet_address'] != wallet_address:
@@ -440,12 +485,7 @@ async def remove_liquidity_by_address(
         pool_data = get_pool(pool_address)
         
         if not pool_data:
-            # Если пул не найден, используем DexManager
-            return await dex_manager.create_remove_liquidity_transaction_by_address(
-                pool_address,
-                position_id,
-                wallet_address
-            )
+            raise HTTPException(status_code=404, detail=f"Пул с адресом {pool_address} не найден в базе данных")
         
         # Создаем транзакцию через DexManager
         transaction = await dex_manager.create_remove_liquidity_transaction_by_address(
@@ -471,9 +511,9 @@ async def remove_liquidity_by_address(
         remove_position(wallet_address, pool_address)
         
         return transaction
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/swap", response_model=SwapTransaction)
@@ -495,7 +535,7 @@ async def create_swap(
             first_pool = get_pool_by_tokens(token_in, path_list[0])
             if not first_pool:
                 raise HTTPException(
-                    status_code=400, 
+                    status_code=404, 
                     detail=f"Пул для токенов {token_in}/{path_list[0]} не найден"
                 )
             
@@ -504,7 +544,7 @@ async def create_swap(
                 intermediate_pool = get_pool_by_tokens(path_list[i], path_list[i+1])
                 if not intermediate_pool:
                     raise HTTPException(
-                        status_code=400, 
+                        status_code=404, 
                         detail=f"Пул для токенов {path_list[i]}/{path_list[i+1]} не найден"
                     )
             
@@ -512,7 +552,7 @@ async def create_swap(
             last_pool = get_pool_by_tokens(path_list[-1], token_out)
             if not last_pool:
                 raise HTTPException(
-                    status_code=400, 
+                    status_code=404, 
                     detail=f"Пул для токенов {path_list[-1]}/{token_out} не найден"
                 )
                 
@@ -529,14 +569,9 @@ async def create_swap(
             # Если путь не указан, проверяем прямой пул
             direct_pool = get_pool_by_tokens(token_in, token_out)
             if not direct_pool:
-                # Пул не найден, пробуем найти маршрут через DexManager
-                route = await dex_manager.get_swap_route(token_in, token_out, int(amount * 10**9))
-                return await dex_manager.create_cross_swap_transaction(
-                    token_in,
-                    token_out,
-                    amount,
-                    wallet_address,
-                    route.path
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"Прямой пул для токенов {token_in}/{token_out} не найден. Укажите путь для свопа."
                 )
             
             # Если прямой пул найден, создаем прямую транзакцию свопа
@@ -563,9 +598,9 @@ async def create_swap(
                 save_price(direct_pool['pool_address'], price)
         
         return transaction
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
         raise HTTPException(status_code=400, detail=f"Ошибка создания транзакции свопа: {str(e)}")
 
 @router.get("/swap/route", response_model=SwapTransaction)
@@ -586,11 +621,14 @@ async def get_swap_route(token_in: str, token_out: str, amount: float, wallet_ad
         # Если прямого пула нет, ищем все доступные пулы для построения маршрута
         all_pools = get_all_pools()
         
-        # Здесь должен быть алгоритм построения оптимального маршрута
-        # через промежуточные токены, но для упрощения используем DexManager
+        if not all_pools:
+            raise HTTPException(status_code=404, detail="Пулы не найдены в базе данных")
         
         # Сначала получаем маршрут обмена через DexManager
-        route = await dex_manager.get_swap_route(token_in, token_out, int(amount * 10**9))
+        try:
+            route = await dex_manager.get_swap_route(token_in, token_out, int(amount * 10**9))
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=f"Не удалось найти маршрут для свопа {token_in} -> {token_out}: {str(e)}")
         
         # Затем создаем транзакцию по этому маршруту
         return await dex_manager.create_cross_swap_transaction(
@@ -600,7 +638,7 @@ async def get_swap_route(token_in: str, token_out: str, amount: float, wallet_ad
             wallet_address,
             route.path
         )
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
         raise HTTPException(status_code=400, detail=str(e)) 
